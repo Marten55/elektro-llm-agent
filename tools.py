@@ -55,6 +55,26 @@ KOEF_HLINIK = 0.78
 # Odporúčané limity úbytku napätia od miesta pripojenia [%] — STN 33 2000-5-52.
 LIMIT_UBYTKU = {"osvetlenie": 3.0, "ostatne": 5.0}
 
+# Keď typ obvodu nepoznáme, platí prísnejší z limitov — poddimenzovaný vodič
+# je horšia chyba než zbytočne hrubý.
+PREDVOLENY_UBYTOK_PCT = min(LIMIT_UBYTKU.values())
+
+# Menovité napätia sústavy [V] podľa počtu fáz. Slúžia na odvodenie počtu fáz,
+# keď ho volajúci nezadá — pozri `_odvod_fazy`.
+NAPATIA = {1: 230.0, 3: 400.0}
+TOLERANCIA_NAPATIA = 0.10
+
+# Hodnoty, ktoré sa doplnia, keď ich volajúci nezadá. Sú na jednom mieste zámerne:
+# každý nástroj vracia v `pouzite_predvolby` zoznam toho, čo si domyslel, aby model
+# vedel rozlíšiť zadaný údaj od predpokladu. `fazy` tu chýba schválne — neháda sa,
+# odvodzuje sa z napätia.
+PREDVOLBY = {
+    "cos_fi": 0.9,
+    "ucinnost": 1.0,
+    "material": "Cu",
+    "typ": "bezny",
+}
+
 
 # --- Pomocné funkcie ---------------------------------------------------------
 
@@ -65,14 +85,70 @@ def _zatazitelnost(prierez_mm2: float, fazy: int, material: str) -> float:
     return zaklad * KOEF_HLINIK if material == "Al" else zaklad
 
 
-def _over_fazy(fazy: int) -> None:
-    if fazy not in (1, 3):
+def _over_fazy(fazy) -> int:
+    """
+    Overí počet fáz a vráti ho ako celé číslo.
+
+    Prevod cez reťazec je tu zámerne: slabšie modely posielajú v tool calle
+    čísla ako text ("3"). Desatinné hodnoty ani nezmysly neprejdú.
+    """
+    try:
+        cislo = int(str(fazy).strip())
+    except (TypeError, ValueError):
+        cislo = None
+    if cislo not in (1, 3):
         raise ValueError("Parameter 'fazy' musí byť 1 (jednofázové) alebo 3 (trojfázové).")
+    return cislo
 
 
 def _over_material(material: str) -> None:
     if material not in REZIVITA:
         raise ValueError("Parameter 'material' musí byť 'Cu' (meď) alebo 'Al' (hliník).")
+
+
+def _predvolba(nazov: str, hodnota, doplnene: list[str]):
+    """
+    Vráti zadanú hodnotu, alebo predvolenú — a tú si poznačí do `doplnene`.
+
+    Vďaka tomu nástroj v odpovedi presne povie, ktoré čísla pochádzajú zo zadania
+    a ktoré si domyslel.
+    """
+    if hodnota is not None:
+        return hodnota
+    doplnene.append(nazov)
+    return PREDVOLBY[nazov]
+
+
+def _odvod_fazy(napatie_v: float, fazy: int | None, doplnene: list[str]) -> int:
+    """
+    Určí počet fáz z napätia, ak ho volajúci nezadal.
+
+    Počet fáz sa zámerne nerieši predvolenou hodnotou: pri 230 V by trojfázový
+    vzorec podhodnotil prúd o 42 % — teda smerom k poddimenzovanému vodiču
+    a ističu. Radšej sa odvodí z napätia, prípadne si vypýta doplnenie.
+    """
+    odvodene = next(
+        (f for f, u in NAPATIA.items() if abs(napatie_v - u) <= u * TOLERANCIA_NAPATIA),
+        None,
+    )
+
+    if fazy is None:
+        if odvodene is None:
+            raise ValueError(
+                f"Z napätia {napatie_v} V sa počet fáz odvodiť nedá (štandard je 230 V "
+                "jednofázovo a 400 V trojfázovo). Zadaj parameter 'fazy' explicitne."
+            )
+        doplnene.append("fazy")
+        return odvodene
+
+    fazy = _over_fazy(fazy)
+    if odvodene is not None and fazy != odvodene:
+        raise ValueError(
+            f"Napätie {napatie_v} V a fazy={fazy} si odporujú — {NAPATIA[odvodene]:.0f} V "
+            f"je {'jednofázové' if odvodene == 1 else 'trojfázové'} napätie. "
+            "Oprav jeden z tých dvoch parametrov."
+        )
+    return fazy
 
 
 # --- Nástroj 1: prúd zo záťaže -----------------------------------------------
@@ -81,9 +157,9 @@ def _over_material(material: str) -> None:
 def vypocitaj_prud(
     vykon_w: float,
     napatie_v: float,
-    fazy: int = 3,
-    cos_fi: float = 0.9,
-    ucinnost: float = 1.0,
+    fazy: int | None = None,
+    cos_fi: float | None = None,
+    ucinnost: float | None = None,
 ) -> dict:
     """
     Vypočíta prevádzkový prúd spotrebiča z jeho výkonu.
@@ -91,11 +167,16 @@ def vypocitaj_prud(
         jednofázové:  I = P / (U × cosφ × η)
         trojfázové:   I = P / (√3 × U × cosφ × η)
     """
-    _over_fazy(fazy)
     if vykon_w <= 0:
         raise ValueError("Výkon musí byť kladné číslo (vo wattoch).")
     if napatie_v <= 0:
         raise ValueError("Napätie musí byť kladné číslo (vo voltoch).")
+
+    doplnene: list[str] = []
+    fazy = _odvod_fazy(napatie_v, fazy, doplnene)
+    cos_fi = _predvolba("cos_fi", cos_fi, doplnene)
+    ucinnost = _predvolba("ucinnost", ucinnost, doplnene)
+
     if not 0 < cos_fi <= 1:
         raise ValueError("Účinník cos φ musí byť v rozsahu (0; 1].")
     if not 0 < ucinnost <= 1:
@@ -116,6 +197,7 @@ def vypocitaj_prud(
         "cos_fi": cos_fi,
         "ucinnost": ucinnost,
         "vzorec": vzorec,
+        "pouzite_predvolby": doplnene,
     }
 
 
@@ -126,10 +208,11 @@ def navrhni_prierez(
     prud_a: float,
     dlzka_m: float,
     napatie_v: float,
-    fazy: int = 3,
-    max_ubytok_pct: float = 3.0,
-    cos_fi: float = 0.9,
-    material: str = "Cu",
+    fazy: int | None = None,
+    max_ubytok_pct: float | None = None,
+    typ_obvodu: str | None = None,
+    cos_fi: float | None = None,
+    material: str | None = None,
 ) -> dict:
     """
     Navrhne prierez vodiča. Posudzuje dve nezávislé kritériá a berie prísnejšie:
@@ -139,14 +222,33 @@ def navrhni_prierez(
              trojfázové:   S = (√3 × ρ × L × I × cosφ) / ΔU_max
       2. prúdová zaťažiteľnosť (tabuľka pre uloženie B2)
     """
-    _over_fazy(fazy)
-    _over_material(material)
     if prud_a <= 0:
         raise ValueError("Prúd musí byť kladné číslo (v ampéroch).")
     if dlzka_m <= 0:
         raise ValueError("Dĺžka vedenia musí byť kladné číslo (v metroch).")
     if napatie_v <= 0:
         raise ValueError("Napätie musí byť kladné číslo (vo voltoch).")
+
+    doplnene: list[str] = []
+    fazy = _odvod_fazy(napatie_v, fazy, doplnene)
+    cos_fi = _predvolba("cos_fi", cos_fi, doplnene)
+    material = _predvolba("material", material, doplnene)
+    _over_material(material)
+
+    # Explicitný limit má prednosť pred typom obvodu; ak nie je ani jedno,
+    # platí prísnejšia z hodnôt v LIMIT_UBYTKU.
+    if max_ubytok_pct is None:
+        if typ_obvodu is None:
+            max_ubytok_pct = PREDVOLENY_UBYTOK_PCT
+            doplnene.append("max_ubytok_pct")
+        elif typ_obvodu not in LIMIT_UBYTKU:
+            raise ValueError(
+                f"Neznámy typ obvodu '{typ_obvodu}'. Použi jednu z hodnôt: "
+                f"{', '.join(LIMIT_UBYTKU)}."
+            )
+        else:
+            max_ubytok_pct = LIMIT_UBYTKU[typ_obvodu]
+
     if not 0 < max_ubytok_pct <= 100:
         raise ValueError("Maximálny úbytok napätia musí byť v rozsahu (0; 100] %.")
 
@@ -188,6 +290,9 @@ def navrhni_prierez(
         "material": material,
         "dlzka_m": dlzka_m,
         "prud_a": prud_a,
+        "fazy": fazy,
+        "typ_obvodu": typ_obvodu,
+        "pouzite_predvolby": doplnene,
     }
 
 
@@ -196,10 +301,10 @@ def navrhni_prierez(
 
 def navrhni_istic(
     prud_a: float,
-    typ: str = "bezny",
+    typ: str | None = None,
     prierez_mm2: float | None = None,
-    fazy: int = 3,
-    material: str = "Cu",
+    fazy: int | None = None,
+    material: str | None = None,
 ) -> dict:
     """
     Vyberie najbližší vyšší menovitý prúd ističa z normalizovanej rady
@@ -207,10 +312,24 @@ def navrhni_istic(
 
     Ak je zadaný prierez vodiča, overí základnú podmienku istenia:  Ib ≤ In ≤ Iz
     """
-    _over_fazy(fazy)
-    _over_material(material)
     if prud_a <= 0:
         raise ValueError("Prúd musí byť kladné číslo (v ampéroch).")
+
+    doplnene: list[str] = []
+    typ = _predvolba("typ", typ, doplnene)
+    material = _predvolba("material", material, doplnene)
+    _over_material(material)
+
+    # Tento nástroj nepozná napätie, takže fázy odvodiť nevie. Používa ich len
+    # na kontrolu zaťažiteľnosti kábla nižšie, kde je 3 bezpečnejšia voľba —
+    # trojfázové uloženie má v tabuľke nižšiu zaťažiteľnosť než jednofázové.
+    if fazy is None:
+        fazy = 3
+        if prierez_mm2 is not None:
+            doplnene.append("fazy")
+    else:
+        fazy = _over_fazy(fazy)
+
     if typ not in CHARAKTERISTIKY:
         raise ValueError(
             f"Neznámy typ záťaže '{typ}'. Použi jednu z hodnôt: {', '.join(CHARAKTERISTIKY)}."
@@ -232,6 +351,7 @@ def navrhni_istic(
         "typ_zataze": typ,
         "vhodne_pre": pouzitie,
         "prevadzkovy_prud_a": prud_a,
+        "pouzite_predvolby": doplnene,
     }
 
     # Kontrola Ib ≤ In ≤ Iz — istič nesmie pustiť viac, než vydrží kábel.
@@ -290,22 +410,30 @@ TOOLS = [
                         "description": "Menovité napätie vo voltoch: 230 pre jednofázové, 400 pre trojfázové.",
                     },
                     "fazy": {
+                        # Bez "enum": [1, 3] — Google/Gemini povoľuje enum len pri
+                        # reťazcoch a číselný variant odmietne celú schému. Rozsah
+                        # stráži `_over_fazy`, ktorá modelu vráti zrozumiteľnú chybu.
                         "type": "integer",
-                        "enum": [1, 3],
-                        "description": "Počet fáz: 1 = jednofázové, 3 = trojfázové. Predvolene 3.",
+                        "description": (
+                            "Počet fáz. NEUVÁDZAJ, ak je napätie 230 V alebo 400 V — nástroj "
+                            "si ho odvodí sám (230 V → 1, 400 V → 3). Zadaj len pri "
+                            "neštandardnom napätí, kde sa odvodiť nedá."
+                        ),
                     },
                     "cos_fi": {
                         "type": "number",
                         "description": (
                             "Účinník cos φ. Odporová záťaž (ohrievač, priamy ohrev) 1,0; "
-                            "motory 0,8–0,85; bežná zmiešaná záťaž 0,9. Predvolene 0,9."
+                            "motory 0,8–0,85; bežná zmiešaná záťaž 0,9. Ak neuvedieš, "
+                            "doplní sa 0,9 a nástroj to oznámi v 'pouzite_predvolby'."
                         ),
                     },
                     "ucinnost": {
                         "type": "number",
                         "description": (
                             "Účinnosť η zariadenia (0 až 1). Použi len ak je zadaný výkon "
-                            "na hriadeli motora, nie príkon zo siete. Predvolene 1,0."
+                            "na hriadeli motora, nie príkon zo siete. Ak neuvedieš, "
+                            "doplní sa 1,0 (teda bez prepočtu)."
                         ),
                     },
                 },
@@ -338,25 +466,45 @@ TOOLS = [
                         "description": "Menovité napätie vo voltoch: 230 alebo 400.",
                     },
                     "fazy": {
+                        # Bez "enum": [1, 3] — Google/Gemini povoľuje enum len pri
+                        # reťazcoch a číselný variant odmietne celú schému. Rozsah
+                        # stráži `_over_fazy`, ktorá modelu vráti zrozumiteľnú chybu.
                         "type": "integer",
-                        "enum": [1, 3],
-                        "description": "Počet fáz: 1 alebo 3. Predvolene 3.",
+                        "description": (
+                            "Počet fáz. NEUVÁDZAJ pri 230 V ani 400 V — nástroj si ho odvodí "
+                            "z napätia. Zadaj len pri neštandardnom napätí."
+                        ),
+                    },
+                    "typ_obvodu": {
+                        "type": "string",
+                        "enum": ["osvetlenie", "ostatne"],
+                        "description": (
+                            "Druh obvodu — určí povolený úbytok napätia podľa normy: "
+                            "'osvetlenie' = 3 %, 'ostatne' = 5 % (zásuvky, stroje, ohrev). "
+                            "Ak neuvedieš ani toto, ani max_ubytok_pct, použije sa "
+                            "prísnejšia hodnota 3 %."
+                        ),
                     },
                     "max_ubytok_pct": {
                         "type": "number",
                         "description": (
-                            "Maximálny povolený úbytok napätia v percentách. "
-                            "Osvetlenie 3 %, ostatné spotrebiče 5 %. Predvolene 3."
+                            "Maximálny povolený úbytok napätia v percentách. Zadaj len ak "
+                            "chceš prebiť hodnotu odvodenú z 'typ_obvodu' vlastným limitom."
                         ),
                     },
                     "cos_fi": {
                         "type": "number",
-                        "description": "Účinník cos φ záťaže. Predvolene 0,9.",
+                        "description": (
+                            "Účinník cos φ záťaže. Ak neuvedieš, doplní sa 0,9 a nástroj "
+                            "to oznámi v 'pouzite_predvolby'."
+                        ),
                     },
                     "material": {
                         "type": "string",
                         "enum": ["Cu", "Al"],
-                        "description": "Materiál jadra: Cu = meď, Al = hliník. Predvolene Cu.",
+                        "description": (
+                            "Materiál jadra: Cu = meď, Al = hliník. Ak neuvedieš, doplní sa Cu."
+                        ),
                     },
                 },
                 "required": ["prud_a", "dlzka_m", "napatie_v"],
@@ -385,7 +533,9 @@ TOOLS = [
                         "description": (
                             "Typ záťaže — určuje charakteristiku. 'bezny' = B (svetlá, "
                             "zásuvky), 'motor' = C (motory, čerpadlá, klimatizácie), "
-                            "'tvrdy_rozbeh' = D (zváračky, transformátory). Predvolene 'bezny'."
+                            "'tvrdy_rozbeh' = D (zváračky, transformátory). Ak neuvedieš, "
+                            "doplní sa 'bezny' — pri motore to však spôsobí vypínanie "
+                            "pri rozbehu, tak ho uveď."
                         ),
                     },
                     "prierez_mm2": {
@@ -396,14 +546,19 @@ TOOLS = [
                         ),
                     },
                     "fazy": {
+                        # Bez "enum": [1, 3] — Google/Gemini povoľuje enum len pri
+                        # reťazcoch a číselný variant odmietne celú schému. Rozsah
+                        # stráži `_over_fazy`, ktorá modelu vráti zrozumiteľnú chybu.
                         "type": "integer",
-                        "enum": [1, 3],
-                        "description": "Počet fáz: 1 alebo 3. Predvolene 3.",
+                        "description": (
+                            "Počet fáz — použije sa len pri kontrole zaťažiteľnosti kábla. "
+                            "Ak neuvedieš, počíta sa s prísnejšou trojfázovou hodnotou."
+                        ),
                     },
                     "material": {
                         "type": "string",
                         "enum": ["Cu", "Al"],
-                        "description": "Materiál jadra vodiča. Predvolene Cu.",
+                        "description": "Materiál jadra vodiča. Ak neuvedieš, doplní sa Cu.",
                     },
                 },
                 "required": ["prud_a"],

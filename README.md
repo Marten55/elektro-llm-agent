@@ -326,8 +326,6 @@ tracebacku.
 
 ## Obmedzenia
 
-> ⚠️ **Toto je školský projekt, nie nástroj na navrhovanie reálnych elektroinštalácií.**
-
 Model je zámerne zjednodušený a **neberie do úvahy** okrem iného:
 
 - súčiniteľ súčasnosti a náročnosti
